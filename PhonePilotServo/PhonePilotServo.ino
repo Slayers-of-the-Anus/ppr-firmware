@@ -14,6 +14,12 @@ bool servoReady = false;
 Preferences preferences;
 String wifiSsid;
 String wifiPassword;
+String workMode = "USB";
+String setupSsid;
+String setupPassword;
+bool setupApActive = false;
+bool pendingApply = false;
+unsigned long applyAt = 0;
 bool wifiConnecting = false;
 bool wifiConnectedReported = false;
 unsigned long wifiAttemptStartedAt = 0;
@@ -30,6 +36,46 @@ constexpr unsigned long WIFI_RETRY_INTERVAL_MS = 10000;
 constexpr unsigned long DISCOVERY_INTERVAL_MS = 1500;
 constexpr uint16_t COMMAND_PORT = 3333;
 constexpr uint16_t DISCOVERY_PORT = 3334;
+
+String generatedSetupPassword() {
+  if (!preferences.begin("phonepilot", false)) return "";
+  String value = preferences.getString("setup_pass", "");
+  if (value.length() < 12) {
+    char text[17];
+    snprintf(text, sizeof(text), "%08lX%08lX", static_cast<unsigned long>(esp_random()),
+             static_cast<unsigned long>(esp_random()));
+    value = String(text);
+    preferences.putString("setup_pass", value);
+  }
+  preferences.end();
+  return value;
+}
+
+void startSetupAp() {
+  setupPassword = generatedSetupPassword();
+  if (setupPassword.length() < 8) {
+    Serial.println("ERR SETUP_PASSWORD_UNAVAILABLE");
+    return;
+  }
+  WiFi.mode(WIFI_AP_STA);
+  setupSsid = "PhonePilot-Setup-" + WiFi.macAddress().substring(9);
+  setupSsid.replace(":", "");
+  setupApActive = WiFi.softAP(setupSsid.c_str(), setupPassword.c_str());
+  if (setupApActive) {
+    Serial.println("SETUP SSID " + setupSsid);
+    Serial.println("SETUP PASSWORD " + setupPassword);
+    Serial.println("SETUP IP " + WiFi.softAPIP().toString());
+  }
+}
+
+bool saveConfiguration(const String& mode, const String& ssid, const String& password) {
+  if (!preferences.begin("phonepilot", false)) return false;
+  const bool ok = preferences.putString("mode", mode) > 0 &&
+                  preferences.putString("ssid", ssid) == ssid.length() &&
+                  preferences.putString("password", password) == password.length();
+  preferences.end();
+  return ok;
+}
 
 void sendResponse(const String& line) {
   Serial.println(line);
@@ -84,14 +130,15 @@ bool saveWifiCredentials(const String& ssid, const String& password) {
 
 void loadWifiCredentials() {
   if (!preferences.begin("phonepilot", true)) return;
+  workMode = preferences.getString("mode", "USB");
   wifiSsid = preferences.getString("ssid", "");
   wifiPassword = preferences.getString("password", "");
   preferences.end();
 }
 
 void startWifiConnection() {
-  if (wifiSsid.length() == 0 || wifiConnecting || WiFi.status() == WL_CONNECTED) return;
-  WiFi.mode(WIFI_STA);
+  if (workMode == "USB" || wifiSsid.length() == 0 || wifiConnecting || WiFi.status() == WL_CONNECTED) return;
+  WiFi.mode(setupApActive ? WIFI_AP_STA : WIFI_STA);
   WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
   wifiConnecting = true;
   wifiConnectedReported = false;
@@ -130,6 +177,16 @@ void stopWifiServices() {
   wifiServicesStarted = false;
 }
 
+void applyConfiguration() {
+  pendingApply = false;
+  if (commandClient) commandClient.stop();
+  WiFi.disconnect(false);
+  wifiConnecting = false;
+  wifiConnectedReported = false;
+  lastWifiAttemptAt = millis() - WIFI_RETRY_INTERVAL_MS;
+  if (workMode != "USB") startWifiConnection();
+}
+
 IPAddress wifiBroadcastAddress() {
   const IPAddress local = WiFi.localIP();
   const IPAddress mask = WiFi.subnetMask();
@@ -158,11 +215,15 @@ void updateWifiConnection() {
       wifiConnectedReported = true;
       sendResponse("WIFI CONNECTED ip=" + WiFi.localIP().toString());
     }
+    if (setupApActive) {
+      WiFi.softAPdisconnect(true);
+      setupApActive = false;
+    }
     broadcastDiscovery();
     return;
   }
 
-  stopWifiServices();
+  if (workMode == "USB") return;
   wifiConnectedReported = false;
   const unsigned long now = millis();
   if (wifiConnecting && now - wifiAttemptStartedAt >= WIFI_CONNECT_TIMEOUT_MS) {
@@ -187,7 +248,7 @@ void moveServo(int target) {
   sendResponse("OK ANGLE " + String(currentAngle));
 }
 
-void handleCommand(String line) {
+void handleCommand(String line, bool fromNetwork = false) {
   line.trim();
   if (line.length() == 0) return;
 
@@ -206,6 +267,49 @@ void handleCommand(String line) {
     printWifiStatus();
     return;
   }
+  if (upper == "MODE_STATUS") {
+    sendResponse("MODE " + workMode);
+    return;
+  }
+  if (fromNetwork && (upper.startsWith("CONFIG ") || upper.startsWith("WIFI_CONFIG "))) {
+    const IPAddress remote = commandClient.remoteIP();
+    const IPAddress accessPoint = WiFi.softAPIP();
+    if (!setupApActive || remote[0] != accessPoint[0] ||
+        remote[1] != accessPoint[1] || remote[2] != accessPoint[2]) {
+      sendResponse("ERR CONFIG_SETUP_ONLY");
+      return;
+    }
+  }
+  if (upper == "CONFIG USB" || upper.startsWith("CONFIG SHARED ") ||
+      upper.startsWith("CONFIG HOTSPOT ")) {
+    String newMode = upper == "CONFIG USB" ? "USB" :
+                     (upper.startsWith("CONFIG SHARED ") ? "SHARED" : "HOTSPOT");
+    String ssid;
+    String password;
+    if (newMode != "USB") {
+      const String args = line.substring(8 + newMode.length());
+      const int separator = args.indexOf(' ');
+      if (separator <= 0 || separator >= static_cast<int>(args.length()) - 1 ||
+          !decodeBase64(args.substring(0, separator), ssid) ||
+          !decodeBase64(args.substring(separator + 1), password) ||
+          ssid.length() == 0 || ssid.length() > 32 ||
+          password.length() < 8 || password.length() > 63) {
+        sendResponse("ERR WIFI_INVALID_CONFIG");
+        return;
+      }
+    }
+    if (!saveConfiguration(newMode, ssid, password)) {
+      sendResponse("ERR WIFI_SAVE_FAILED");
+      return;
+    }
+    workMode = newMode;
+    wifiSsid = ssid;
+    wifiPassword = password;
+    sendResponse("OK CONFIG_SAVED mode=" + workMode);
+    pendingApply = true;
+    applyAt = millis() + 700;
+    return;
+  }
   if (upper.startsWith("WIFI_CONFIG ")) {
     const String arguments = line.substring(12);
     const int separator = arguments.indexOf(' ');
@@ -221,18 +325,16 @@ void handleCommand(String line) {
       sendResponse("ERR WIFI_INVALID_CONFIG");
       return;
     }
-    if (!saveWifiCredentials(ssid, password)) {
+    if (!saveConfiguration("HOTSPOT", ssid, password)) {
       sendResponse("ERR WIFI_SAVE_FAILED");
       return;
     }
     wifiSsid = ssid;
     wifiPassword = password;
-    stopWifiServices();
-    WiFi.disconnect(true);
-    wifiConnecting = false;
-    lastWifiAttemptAt = millis() - WIFI_RETRY_INTERVAL_MS;
+    workMode = "HOTSPOT";
     sendResponse("OK WIFI_SAVED");
-    startWifiConnection();
+    pendingApply = true;
+    applyAt = millis() + 700;
     return;
   }
   if (upper == "CENTER") {
@@ -284,7 +386,7 @@ void readWifiCommands() {
       commandClient = incoming;
       commandClient.setNoDelay(true);
       wifiInputLine = "";
-      sendResponse("PHONEPILOT_ESP32_READY v0.3-arduino");
+      sendResponse("PHONEPILOT_ESP32_READY v0.4-arduino");
       printStatus();
       printWifiStatus();
     }
@@ -294,7 +396,7 @@ void readWifiCommands() {
     const char c = static_cast<char>(commandClient.read());
     if (c == '\r') continue;
     if (c == '\n') {
-      handleCommand(wifiInputLine);
+      handleCommand(wifiInputLine, true);
       wifiInputLine = "";
       continue;
     }
@@ -316,14 +418,17 @@ void setup() {
     delay(300);
   }
 
-  Serial.println("PHONEPILOT_ESP32_READY v0.3-arduino");
+  Serial.println("PHONEPILOT_ESP32_READY v0.4-arduino");
   printStatus();
   loadWifiCredentials();
-  if (wifiSsid.length() > 0) startWifiConnection();
+  startSetupAp();
+  startWifiServices();
+  if (workMode != "USB" && wifiSsid.length() > 0) startWifiConnection();
 }
 
 void loop() {
   readSerialCommands();
+  if (pendingApply && static_cast<long>(millis() - applyAt) >= 0) applyConfiguration();
   updateWifiConnection();
   readWifiCommands();
   delay(2);

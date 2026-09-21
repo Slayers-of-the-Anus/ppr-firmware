@@ -1,8 +1,10 @@
-# ESP32 control protocol v0.3 (Arduino IDE)
+# ESP32 control protocol v0.4 (Arduino IDE)
 
 Transport: USB serial ASCII text, 115200 baud, 8 data bits, 1 stop bit, no parity. Commands are one per line. Firmware accepts `\n` and `\r\n`.
 
 The same commands and responses are available over TCP port 3333 after Wi-Fi provisioning. ESP32 discovery beacons use UDP port 3334 with payload `PHONEPILOT_ESP32 port=3333`.
+
+At boot ESP32 also exposes a password-protected `PhonePilot-Setup-XXXXXX` access point at `192.168.4.1`. Its randomly generated password is printed to the Arduino Serial Monitor and persists in NVS. TCP port 3333 on that network accepts configuration. Network configuration commands from the ordinary shared LAN are rejected; USB and the setup AP can change the mode.
 
 Commands:
 
@@ -13,6 +15,12 @@ Commands:
 - `S<n>` -> canonical compact command used by Android
 - `WIFI_CONFIG <base64-ssid> <base64-password>` -> validate and persist generated Android hotspot credentials, then connect
 - `WIFI_STATUS` -> `WIFI STATUS state=<state> ip=<address>`
+- `MODE_STATUS` -> `MODE USB|HOTSPOT|SHARED`
+- `CONFIG USB` -> save USB-only mode
+- `CONFIG HOTSPOT <base64-ssid> <base64-password>` -> save phone-hotspot mode and credentials
+- `CONFIG SHARED <base64-ssid> <base64-password>` -> save shared-router mode and credentials
+
+Successful configuration returns `OK CONFIG_SAVED mode=<mode>` before the Wi-Fi transition begins. `WIFI_CONFIG` remains supported as a legacy alias for hotspot provisioning.
 
 Successful motion returns `OK ANGLE <n>` only after the target has been accepted by the servo driver. Invalid/not-ready commands return `ERR <code> ...`.
 
